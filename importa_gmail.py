@@ -398,8 +398,12 @@ class Importer:
                 markers = [x["value"].strip() for x in message.get("payload", {}).get("headers", [])
                            if x["name"].casefold() == HEADER.casefold()]
                 if fingerprint in markers:
-                    if markers != [fingerprint]:
-                        raise UncertainImport(f"{fingerprint}: marcatori ambigui; verifica manuale")
+                    if any(value != fingerprint for value in markers):
+                        raise UncertainImport(
+                            f"{fingerprint}: ID Gmail={item['id']} verifica=marcatore discordante; "
+                            f"marcatori={len(markers)}; coerenti={markers.count(fingerprint)}; "
+                            "verifica manuale, nessun reinvio"
+                        )
                     matches.add(item["id"])
             page = result.get("nextPageToken")
             if not page:
@@ -408,7 +412,8 @@ class Importer:
                 raise UncertainImport(f"{fingerprint}: verifica mirata oltre 100 candidati; nessun reinvio")
         if len(matches) != 1:
             raise UncertainImport(
-                f"{fingerprint}: verifica mirata inconcludente ({len(matches)} corrispondenze). "
+                f"{fingerprint}: ID Gmail=non disponibile; verifica mirata inconcludente "
+                f"({len(matches)} corrispondenze, {examined} candidati esaminati). "
                 "L'assenza dai risultati non prova il mancato import. "
                 "Attendere e riprendere oppure verificare manualmente; nessun reinvio."
             )
@@ -416,7 +421,68 @@ class Importer:
 
     def get_message(self, message_id):
         return self.request("GET", API + "/messages/" + message_id, cost=20,
-                            params={"format": "metadata", "metadataHeaders": HEADER})
+                            params={"format": "metadata", "metadataHeaders": [
+                                HEADER, "Message-ID", "From", "Subject", "Date"
+                            ]})
+
+    def verify_message(self, message_id, fingerprint, headers, dt):
+        # Solo GET dell'ID noto: nessuna ricerca o deduzione di mancato import.
+        def fail(kind, counts):
+            reason = (f"{fingerprint}: ID Gmail={message_id} verifica={kind}; {counts}. "
+                      "Checkpoint conservato; nessuna etichettatura o reinvio.")
+            with self.db:
+                self.db.execute("UPDATE messages SET error=? WHERE hash=?", (reason, fingerprint))
+            raise StopRun(reason)
+
+        try:
+            message = self.get_message(message_id)
+        except APIError as exc:
+            if exc.status == 404:
+                fail("ID non trovato (HTTP 404)", "messaggi recuperati=0; marcatori=non disponibili")
+            raise
+        remote = message.get("payload", {}).get("headers", [])
+
+        def values(name):
+            return [str(x.get("value", "")).strip() for x in remote
+                    if x.get("name", "").casefold() == name.casefold()]
+
+        markers = values(HEADER)
+        matching = sum(value == fingerprint for value in markers)
+        counts = f"messaggi recuperati=1; marcatori={len(markers)}; marcatori coerenti={matching}"
+        if message.get("id") != message_id:
+            fail("ID risposta discordante o assente", counts)
+        if markers:
+            if matching != len(markers):
+                fail("marcatore discordante", counts)
+            # Più copie dello stesso hash sul medesimo ID non sono più messaggi.
+            return message
+
+        # Senza marcatore occorre una combinazione completa, non il solo ID
+        # RFC822 (che può essere condiviso). Date nell'upload è riscritta con dt.
+        def canonical(value):
+            return " ".join(str(value).split())
+
+        for name in ("Message-ID", "From", "Subject"):
+            local = [canonical(value) for value in headers.get_all(name, [])]
+            actual = [canonical(value) for value in values(name)]
+            detail = f"{counts}; intestazioni {name} locali={len(local)} remote={len(actual)}"
+            if len(local) != 1 or len(actual) != 1 or not local[0] or not actual[0]:
+                fail(f"identità insufficiente ({name})", detail)
+            if local != actual:
+                fail(f"identità discordante ({name})", detail)
+        dates = values("Date")
+        detail = f"{counts}; intestazioni Date remote={len(dates)}"
+        if len(dates) != 1:
+            fail("identità insufficiente (Date)", detail)
+        try:
+            remote_date = parsedate_to_datetime(dates[0])
+            if remote_date.tzinfo is None:
+                fail("identità insufficiente (Date senza fuso)", detail)
+            if abs(remote_date.timestamp() - dt.timestamp()) > 1:
+                fail("identità discordante (Date)", detail)
+        except (ValueError, TypeError, OverflowError):
+            fail("identità insufficiente (Date non valida)", detail)
+        return message
 
     def ensure_folder(self, name):
         if (not isinstance(name, str) or not name.strip()
@@ -632,11 +698,7 @@ class Importer:
 
         # Lettura del solo ID restituito dall'import o salvato nel checkpoint:
         # verifica d'identità, non ricerca di duplicati nella casella.
-        message = self.get_message(message_id)
-        markers = [x["value"].strip() for x in message.get("payload", {}).get("headers", [])
-                   if x["name"].casefold() == HEADER.casefold()]
-        if markers != [h]:
-            raise StopRun(f"Marcatore API non univoco per {h}; nessuna modifica")
+        message = self.verify_message(message_id, h, headers, dt)
         if message.get("internalDate") and abs(int(message["internalDate"]) / 1000 - dt.timestamp()) > 1:
             LOG.warning("%s: internalDate Gmail differisce dalla data checkpoint (%s)", h, dt.isoformat())
         # Mapping già validato prima di qualsiasi upload; si applica solo
